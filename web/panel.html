@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+<meta charset="UTF-8">
+<title>RTMP Control Panel</title>
+
+<!-- Chart.js CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {
+    background:#0f0f0f;
+    color:#00ff99;
+    font-family: monospace;
+    padding:20px;
+    margin:0;
+}
+
+.container {
+    max-width: 700px;
+    margin: auto;
+}
+
+.box {
+    border:1px solid #00ff99;
+    padding:12px;
+    margin:10px 0;
+    border-radius:8px;
+    background:rgba(0,255,153,0.03);
+}
+
+.bad { color:#ff4444; }
+.good { color:#00ff99; }
+
+/* Responsive design */
+@media (max-width: 600px) {
+    body, .container {
+        padding: 5px;
+    }
+    .box {
+        padding: 8px;
+        font-size: 15px;
+    }
+    h1 {
+        font-size: 1.2em;
+    }
+}
+</style>
+</head>
+
+
+<body>
+<div class="container">
+<h1>📡 RTMP CONTROL DASHBOARD</h1>
+
+<!-- Stream Controls (placeholder, needs backend support) -->
+<div class="box" id="controls">
+    <b>Stream Controls</b><br>
+    <button onclick="alert('Not implemented: Start Stream')">Start Stream</button>
+    <button onclick="alert('Not implemented: Stop Stream')">Stop Stream</button>
+    <span style="font-size:0.9em;color:#888">(Requires backend support)</span>
+</div>
+
+<div class="box" id="status">Loading...</div>
+<div class="box" id="server"></div>
+<div class="box" id="streams"></div>
+<div class="box" id="clients"></div>
+
+<!-- Bandwidth Chart -->
+<div class="box">
+    <b>Bandwidth (last 2 min)</b><br>
+    <canvas id="bwChart" height="80"></canvas>
+</div>
+
+<!-- Logging/History (basic, in-memory) -->
+<div class="box" id="logBox">
+    <b>Event Log</b>
+    <div id="log" style="max-height:120px;overflow:auto;font-size:0.95em;"></div>
+</div>
+
+</div>
+
+
+<script>
+const STAT_URL = '/stat';
+
+// --- Chart.js Setup ---
+const bwData = {
+    labels: Array(60).fill(''), // 2 min at 2s interval
+    datasets: [
+        {
+            label: 'BW In',
+            data: Array(60).fill(0),
+            borderColor: '#00ff99',
+            backgroundColor: 'rgba(0,255,153,0.1)',
+            tension: 0.2,
+        },
+        {
+            label: 'BW Out',
+            data: Array(60).fill(0),
+            borderColor: '#4488ff',
+            backgroundColor: 'rgba(68,136,255,0.1)',
+            tension: 0.2,
+        }
+    ]
+};
+let bwChart;
+window.addEventListener('DOMContentLoaded', () => {
+    const ctx = document.getElementById('bwChart').getContext('2d');
+    bwChart = new Chart(ctx, {
+        type: 'line',
+        data: bwData,
+        options: {
+            responsive: true,
+            plugins: {
+                legend: { labels: { color: '#00ff99' } },
+            },
+            scales: {
+                x: { display: false },
+                y: {
+                    beginAtZero: true,
+                    ticks: { color: '#00ff99', callback: v => formatBytes(v) }
+                }
+            }
+        }
+    });
+});
+
+// --- Logging ---
+const logArr = [];
+function logEvent(msg) {
+    const now = new Date();
+    const t = now.toLocaleTimeString();
+    logArr.unshift(`[${t}] ${msg}`);
+    if (logArr.length > 50) logArr.length = 50;
+    document.getElementById('log').innerHTML = logArr.join('<br>');
+}
+
+function escapeHTML(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+    }[char]));
+}
+
+function directText(parent, tagName, fallback = '0') {
+    const node = Array.from(parent.children).find(child => child.tagName === tagName);
+    return node?.textContent || fallback;
+}
+
+function numberValue(value, fallback = 0) {
+    const parsed = parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+// Helper: parse XML string to DOM
+function parseXML(xmlStr) {
+    if (window.DOMParser) {
+        return new window.DOMParser().parseFromString(xmlStr, "text/xml");
+    } else { // IE fallback
+        var xmlDoc = new ActiveXObject("Microsoft.XMLDOM");
+        xmlDoc.async = false;
+        xmlDoc.loadXML(xmlStr);
+        return xmlDoc;
+    }
+}
+
+function formatBytes(bytes) {
+    bytes = numberValue(bytes);
+    if (isNaN(bytes)) return '0 B';
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    if (bytes === 0) return '0 B';
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return (bytes / Math.pow(1024, i)).toFixed(2) + ' ' + sizes[i];
+}
+
+function formatTime(seconds) {
+    seconds = numberValue(seconds);
+    if (isNaN(seconds) || seconds < 0) return '0s';
+    // If value is too large, treat as ms
+    if (seconds > 60 * 60 * 24 * 365) seconds = Math.floor(seconds / 1000);
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    // Always pad with two digits for m and s
+    const pad = n => n.toString().padStart(2, '0');
+    return `${h}h ${pad(m)}m ${pad(s)}s`;
+}
+
+
+// For live ticking times
+let liveClients = [];
+let liveStreams = [];
+let liveTickStart = Date.now();
+let lastBWIn = 0, lastBWOut = 0;
+let lastStatus = '';
+
+
+function renderLiveTimes() {
+    const now = Date.now();
+    const elapsed = Math.floor((now - liveTickStart) / 1000);
+    // Streams
+    for (const s of liveStreams) {
+        const el = document.getElementById(s.domId);
+        if (el) el.textContent = formatTime(s.base + elapsed);
+    }
+    // Clients
+    for (const c of liveClients) {
+        const el = document.getElementById(c.domId);
+        if (el) el.textContent = formatTime(c.base + elapsed);
+    }
+}
+
+async function update() {
+    try {
+        let res = await fetch(STAT_URL, { cache: 'no-store' });
+        if (!res.ok) throw new Error('Network error');
+        let text = await res.text();
+        let xml = parseXML(text);
+        if (xml.getElementsByTagName('parsererror').length) throw new Error('Invalid stats XML');
+
+        // Server info
+        const root = xml.getElementsByTagName('rtmp')[0] || xml;
+        const uptime = directText(root, 'uptime');
+        const bytesIn = directText(root, 'bytes_in');
+        const bytesOut = directText(root, 'bytes_out');
+        const bwIn = directText(root, 'bw_in');
+        const bwOut = directText(root, 'bw_out');
+
+        document.getElementById("server").innerHTML = `
+<b>Server Info</b><br>
+⏱️ Uptime: ${formatTime(uptime)}<br>
+⬇️ Bytes In: ${formatBytes(bytesIn)}<br>
+⬆️ Bytes Out: ${formatBytes(bytesOut)}<br>
+📥 BW In: ${formatBytes(bwIn)}/s<br>
+📤 BW Out: ${formatBytes(bwOut)}/s
+`;
+
+        // Update chart
+        if (bwChart) {
+            bwData.datasets[0].data.push(numberValue(bwIn));
+            bwData.datasets[1].data.push(numberValue(bwOut));
+            if (bwData.datasets[0].data.length > 60) bwData.datasets[0].data.shift();
+            if (bwData.datasets[1].data.length > 60) bwData.datasets[1].data.shift();
+            bwChart.update();
+        }
+
+        // Streams info (support multiple streams)
+        let streams = xml.getElementsByTagName('stream');
+        let streamsHTML = `<b>Streams</b><br>`;
+        let totalConnections = 0;
+        let totalPublishers = 0;
+        let totalViewers = 0;
+        let activeStreams = 0;
+        liveStreams = [];
+        liveTickStart = Date.now();
+        if (streams.length === 0) {
+            streamsHTML += '<span class="bad">No active streams</span>';
+        } else {
+            for (let i = 0; i < streams.length; i++) {
+                let s = streams[i];
+                let name = directText(s, 'name', 'N/A');
+                let connectionCount = numberValue(directText(s, 'nclients'));
+                let streamClients = Array.from(s.children).filter(child => child.tagName === 'client');
+                let publisherCount = streamClients.filter(c => c.getElementsByTagName('publishing').length > 0).length;
+                let viewerCount = streamClients.length > 0
+                    ? streamClients.length - publisherCount
+                    : connectionCount;
+                let isActive = s.getElementsByTagName('active').length > 0 || numberValue(directText(s, 'time')) > 0;
+                let time = directText(s, 'time');
+                let bw = directText(s, 'bw_out');
+                let timeNum = numberValue(time);
+                if (timeNum > 60 * 60 * 24 * 365) timeNum = Math.floor(timeNum / 1000);
+                if (isNaN(timeNum) || timeNum < 0) timeNum = 0;
+                const domId = `stream_time_${i}`;
+                streamsHTML += `
+🔴 <b>${escapeHTML(name)}</b> — Viewers: ${viewerCount}, Publishers: ${publisherCount}, Connections: ${connectionCount}, Uptime: <span id="${domId}">${formatTime(timeNum)}</span>, BW Out: ${formatBytes(bw)}/s<br>`;
+                liveStreams.push({ domId, base: timeNum });
+                if (isActive) activeStreams++;
+                totalConnections += connectionCount;
+                totalPublishers += publisherCount;
+                totalViewers += viewerCount;
+            }
+        }
+        document.getElementById("streams").innerHTML = streamsHTML;
+
+        // Status
+        let statusStr =
+            activeStreams > 0
+            ? `<span class="good">🟢 LIVE: ${activeStreams} stream(s), ${totalViewers} viewer(s), ${totalPublishers} publisher(s), ${totalConnections} connection(s)</span>`
+            : '<span class="bad">🔴 OFFLINE</span>';
+        document.getElementById("status").innerHTML = statusStr;
+
+        // Log status change
+        if (statusStr !== lastStatus) {
+            logEvent(statusStr.replace(/<[^>]+>/g, ''));
+            lastStatus = statusStr;
+        }
+
+        // Remove bandwidth log entries (no logging for BW changes)
+        lastBWIn = bwIn;
+        lastBWOut = bwOut;
+
+        // Clients info (list all clients if available)
+        let clientsHTML = `<b>Connections</b><br>`;
+        let clientNodes = xml.getElementsByTagName('client');
+        liveClients = [];
+        if (clientNodes.length === 0) {
+            clientsHTML += 'No RTMP connections.';
+        } else {
+            for (let i = 0; i < clientNodes.length; i++) {
+                let c = clientNodes[i];
+                let ip = directText(c, 'address', 'N/A');
+                let time = directText(c, 'time');
+                let agent = directText(c, 'flashver', 'N/A');
+                let role = c.getElementsByTagName('publishing').length > 0 ? 'Publisher' : 'Viewer';
+                let timeNum = numberValue(time);
+                if (timeNum > 60 * 60 * 24 * 365) timeNum = Math.floor(timeNum / 1000);
+                if (isNaN(timeNum) || timeNum < 0) timeNum = 0;
+                const domId = `client_time_${i}`;
+                clientsHTML += `👤 ${escapeHTML(ip)} — ${role}, Connected: <span id="${domId}">${formatTime(timeNum)}</span>, Agent: ${escapeHTML(agent)}<br>`;
+                liveClients.push({ domId, base: timeNum });
+            }
+        }
+        document.getElementById("clients").innerHTML = clientsHTML;
+
+    } catch (e) {
+        document.getElementById("status").innerHTML = '<span class="bad">❌ Error loading stats</span>';
+        document.getElementById("server").innerHTML = '';
+        document.getElementById("streams").innerHTML = '';
+        document.getElementById("clients").innerHTML = '';
+        logEvent('❌ Error loading stats');
+        liveClients = [];
+        liveStreams = [];
+    }
+}
+
+setInterval(update, 2000);
+update();
+setInterval(renderLiveTimes, 1000);
+</script>
+
+</body>
+</html>
